@@ -1,0 +1,228 @@
+#!/usr/bin/perl
+# Делаем ЖОСКА
+use strict;
+# Подключаем использование потоков и общедоступных переменных
+use threads qw/yield stringify/;
+use threads::shared;
+# Модуль работы с базами данных
+use DBI;
+# Подключаем процедуру пинга
+use Net::Ping;
+# Автоочищение буфера (исп для эксп, возм нужн удал)
+$| = 1;
+my %state :shared;						# Хэш состояний устройств Ключ - поле устройства key в бд, Значение - его достижимость в %
+my @threads;					# Массив идентификаторов запускаемых нитей
+my %settings :shared;
+
+sub start {
+	my $set = shift;
+	my $stt = shift;
+	my $thr = shift;						# Получаем в переменные сслыки на глобальный массив настроек, устройств, потоков
+
+	# Читаем параметры подключения из конфига
+	%{$set} = &read_config;
+	# Выбираем всю информацию об устройствах из БД
+	my %devices = &get_devices ($set->{'db_host'}, $set->{'db_user'}, $set->{'db_password'}, $set->{'db_name'});
+	# Выбираем интервал опроса устройств
+	my @p = &get_web_settings ($set->{'db_host'}, $set->{'db_user'}, $set->{'db_password'}, $set->{'db_name'});
+	my $polling_interval = $p[0];
+	my $keep_log = $p[1];
+	#my $polling_interval = &get_web_settings ($set->{'db_host'}, $set->{'db_user'}, $set->{'db_password'}, $set->{'db_name'});
+	my $device_amount = scalar keys %devices;								 # Количество устройств
+	my $max_polling_time = 10;												 # Максимальное время опроса одного устройства
+	use POSIX qw/floor ceil/;												 # Подключаем округления в меньшую/большую сторону
+	my $thread_device_amount = floor($polling_interval / $max_polling_time); # Колчичество устройств, проверяемых одним потоком, исходя из времени
+	my $thread_amount = ceil($device_amount / $thread_device_amount);		 # Количество потоков, обработающих все устройства
+	close POSIX;
+	my $index = undef;						# Индексная переменная, для разделения устройств по нитям
+	my $end_index = $device_amount;			# Количество считанных устройств (переменная для наглядности)
+	my %thread_devices = ();				# Хэш, для устройств, отправляющихся в на обработку в отдельную нить
+
+	foreach (keys %devices) {
+		push @{$thread_devices{$_}}, @{$devices{$_}};
+		# Если порядковый номер обрабатываемого устройства делится на количество устройств в одной нити без остатка,
+		# что означает, что в @thread_devices набралось необходимое для одной нити колчичество устройств,
+		# или этот индекс полсдений, то
+		if (++$index % $thread_device_amount == 0 || $index == $end_index) {
+			# Сохранаяем ссылку на поток в массив и передаем нити данные об устройствах для обработки (пинга)
+			push @{$thr}, async { \&thread_polling(\%thread_devices, $stt, $set, $keep_log); };
+			%thread_devices = ();		# Зануляем массив, для сбора информации для следующей нити
+		}
+	}
+}
+
+# Возвращает хеш с параметрами из конфигурационного файла
+sub read_config {
+	# Открываем дескриптор файла net manager.cfg, лежащего в той же директории, что и скрипт
+	open CONFIG, "net manager.cfg" or die "Не удалось открыть конфигурационный файл.\n";
+	my %params;					# Читаем параметры в хеш до тех пор, пока они есть
+	while (<CONFIG>) {
+		chomp;					# Отрезаем конец строки
+		s/\s*#.*$//g;			# Заменить все s пробельные символы \s и все .* после символа # до конца строки $ на пустоту //
+		s/\s+$//g;				# Убрать пробелы в конце строки.
+		s/^\s+//g;				# Убрать пробелы в begin строки.
+		s/\s+\=\s+/=/g;			# убрать пробелы между
+		if (/=/) {				# Если встретилось =, значит есть ключ => значение, и мы их заносим в хеш
+			$params{$`} = $';
+		}
+	}
+	close CONFIG;				# Закрываем дескриптор файла и возвращаем хеш параметров
+	%params;
+}
+
+# Подключается к БД и выбирает информацию по всем устройствам
+sub get_devices {
+	# Собираем параметры, подключаемся, создаем выборку из нужных демону параметров устройства
+	my ($h, $u, $p, $n) = @_;
+	my $connection = DBI->connect("dbi:Pg:dbname=$n;host=$h;", $u, $p) or die $DBI::errstr;
+	my $p = $connection->prepare("SELECT ip, polling_protocol, snmp_flag, community, key, polling_port FROM devices WHERE polling_flag = 'true'");
+	my %devices;								# Объявляем хэш устройств
+	if (defined $p->execute()) {				# Если выборка удалась
+		while (my @row = $p->fetchrow_array()) {# Обрабатываем ее строки, пока не кончатся
+			my $key_ip = shift @row;			# Вырезаем IP-адрес устройства, станущий впоследствии ключом
+			@{$devices{$key_ip}} = @row;		# Массив @row копируется в новый массив @ без имени, элемент хэша %devices c ключем $key_ip
+												# станет ссылкой на него
+		}
+		%devices;								# Возвращаем хэш
+	}
+}
+
+# Подлкючается к БД и выбирает установки демона (polling_interval)
+sub get_web_settings {
+	# Делаем то же что и в предыдущей функции, но ПОКА ЧТО возвращаем лишь одно значение с одной строки
+	my ($h, $u, $p, $n) = @_;
+	#my $connection = DBI->connect("dbi:Pg:dbname=$n;host=$h;", $u, $p) or die $DBI::errstr;
+	my $connection = DBI->connect("dbi:Pg:dbname=$n;host=$h;", $u, $p) or die $DBI::errstr;
+	my $p = $connection->prepare("SELECT polling_interval, keep_log FROM settings");
+	if (defined $p->execute()) {
+		#($p->fetchrow_array())[0];
+		$p->fetchrow_array();
+	}
+}
+
+# Процедура опроса нескольких устройств
+sub thread_polling {
+	$SIG{'KILL'} = sub { threads->exit(); };		# При получении сигнала KILL окончить работу
+	$SIG{CHLD} = \&REAPER;							# Чтобы при отключении процесса, закопать его
+	#my $tid = threads->self->tid;					# Вспомогательная переменная для форматированного вывода
+	my $dev = shift;								# на хэш опрашиваемых устройств
+	my $stt = shift;								# Выталкиваем ссылку на хэш состояний (именно выталкиваем, а не копируем)
+	my $set = shift;
+	my $log = shift;
+	while (1) {										# Постоянно пингуем каждое устройство пятью пингами и делим на 5
+		foreach (keys %{$dev}) {					# для получения процентной величины достижимости
+			my $percent = &ping ($_, $dev->{$_}[0]) / 5;	# Вычисляем в % достижимость устройства
+			if ($log) {					# Если нужно вести лог
+				my $connection = DBI->connect("dbi:Pg:dbname=$set->{'db_name'};host=$set->{'db_host'};", $set->{'db_user'}, $set->{'db_password'}) or die $DBI::errstr;
+				my $p;
+				if ($stt->{ $dev->{$_}[3] } == 0 && $percent != 0) {
+					$p = $connection->prepare("INSERT INTO events (device, event) VALUES ('$dev->{$_}[3]', '1')");
+					$p->execute();					# Устройство поднялось
+				}
+				elsif ( ( not defined $stt->{ $dev->{$_}[3] } || $stt->{ $dev->{$_}[3] } != 0 ) && $percent == 0) {
+					$p = $connection->prepare("INSERT INTO events (device, event) VALUES ('$dev->{$_}[3]', '0')");
+					$p->execute();					# Устройство упало
+				}
+				$stt->{ $dev->{$_}[3] } = $percent;	# Заносим в хэш состояний (его структура описана ниже)
+			}
+		}
+	}
+	return 1;
+}
+
+# Опрашивает host по протоколу prot, в случае, если указан порт, на порт port
+# Возвращает количество доставленных пакетов
+sub ping {
+	my ($host, $prot, $port) = @_;			# Забираем передаваемые аргументы
+	$host = "localhost" unless $host;		# Задаем умолчания, если данных не поступило
+	$prot = "icmp" unless $prot;
+	my $ping = Net::Ping->new($prot);		# Создаем экземпляр пинга
+	if ($prot == "tcp" and $port) {			# Если протокол tcp и порт указан - задаем его пингу
+		$ping->port_number($port);
+		}
+	my $packages = 0;						# Создаем возвращаемую переменную (кол-во принятых пакетов)
+	foreach (1..5) {						# Отправляем 5 пакетов с интервалом в 1 секунду
+		$packages++ if $ping->ping($host, 1);
+		sleep (1) unless $_ == 5;			# После последнего пинга не спим, а возвращаем результат
+	}
+	#$new_time = time - $time;
+	$packages;
+}
+# Запускать от root
+# Примеры вызова : &ping() // localhost, icmp
+#				 : &ping("192.168.20.56", "tcp", 24) // 192.168.20.56, tcp, 24 порт
+# 				 : &ping("10.0.0.1", "tcp") // 10.0.0.1, tcp, echo
+
+# Процедура, содержащая сервер, возвращающий массив "отвалившихся устройств"
+sub settings_server {
+	$SIG{'KILL'} = sub { threads->exit(); };
+	$SIG{CHLD} = \&REAPER;
+	my $stt = shift;								# Получаем для обработки хэш состояний устройств
+	my $port  = shift || 2346;						# Получаем порт, на который будут приниматься запросы от клиентов
+	use Socket;										# Подключаем Сокеты
+	socket(Server, PF_INET, SOCK_STREAM, getprotobyname("tcp"))    || die "socket: $!";		# Создаем сокет в Server
+	setsockopt(Server, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) || die "setsockopt: $!";		# Установки сокета
+	bind(Server, sockaddr_in($port, INADDR_ANY))    || die "bind: $!";						# Связываем сокет с любым IP
+	listen(Server, SOMAXCONN)                       || die "listen: $!";					# Начинаем слушать
+	my $paddr;										# Работаем вечно (условие выхода не задано) в конце цикла обмена сообщениями
+	for ( ; $paddr = accept(Client, Server); close Client ) {	# закрываем соединение с конкретным клиентом
+		# Превращаем хэш в массив и передаем запросившему клиенту - сам разберется чё сделать
+		my @answer = %{$stt};
+		print Client "@answer";
+	}
+	close Server;
+	close Socket;
+}
+
+# Процедура, содержащая сервер, делающий "рестарт"
+sub dispatcher {
+	use Switch;
+	# 3 ссылки на глобальные массивы все кочуют и кочуют
+	my $thr = shift;
+	my $set = shift;
+	my $stt = shift;
+	my $port  = 2345;
+	$SIG{'KILL'} = sub { threads->exit(); };
+	$SIG{CHLD} = \&REAPER;
+	use Socket;
+	socket(Server, PF_INET, SOCK_STREAM, getprotobyname("tcp"))    || die "socket: $!";
+	setsockopt(Server, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) || die "setsockopt: $!";
+	bind(Server, sockaddr_in($port, INADDR_ANY))    || die "bind: $!";
+	listen(Server, SOMAXCONN)                       || die "listen: $!";
+	my $paddr;
+	for ( ; $paddr = accept(Client, Server); close Client ) {
+		my $line = <Client>;
+		# Получив сигнал на рестарт
+		if ($line == 'restart') {
+			# Убиваем потоки
+			for (my $i = 0; $i < scalar @{$thr}; $i++) {
+				${$thr}[$i]->kill('SIGKILL');
+			}
+			# Обнуляем хэш состояний (если рестарт сервера вызван удалением устройства, нужно удалить соответствующий ключ)
+			%{$stt} = ();
+			# Запускаем все заново
+			&start($set, $stt, $thr);
+		}
+	}
+	close Server;
+	close Socket;
+}
+
+# Запуск потоков
+&start(\%settings, \%state, \@threads);
+# Запуск сервера, принимающего сигналы
+my $dispatcher = threads->create(\&dispatcher, \@threads, \%settings, \%state);
+# Запуск сервера, возвращающего результаты на запросы
+my $state_server = threads->create(\&settings_server, \%state, $settings{'port'}, )->join;
+
+=cокрытый способ вывода всех управляющих сигналов
+use Config;
+defined $Config{sig_name} or die "No sigs\n";
+print "sig_name\tsin_no\n";
+foreach $names (split (' ', $Config{sig_name})) {
+	$signo{$names} = $i;
+	$signame[$i] = $names;
+	$i++;
+	print "$names\t\t$i\n";
+}
+=cut
