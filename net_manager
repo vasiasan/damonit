@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# Делаем ЖОСКА
+# Делаем ЖОСКА1
 use strict;
 # Подключаем использование потоков и общедоступных переменных
 use threads qw/yield stringify/;
