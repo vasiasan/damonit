@@ -42,7 +42,7 @@ function draw_image ( sourse, x_pos, y_pos, state, need_text, text) {
 	if (sourse != "img/group.png") {
 		map.beginPath();
 		//map.arc(x_pos - (-25), y_pos - 25, 5, 0, Math.PI * 2, false);
-		map.arc(x_pos, y_pos, 50, 0, Math.PI * 2, false);
+		map.arc(x_pos, y_pos, 25, 0, Math.PI * 2, false);
 		map.closePath();
 		map.fillStyle = color;
 		map.stroke();
